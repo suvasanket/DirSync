@@ -1,12 +1,32 @@
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
 #include <sys/stat.h>
 #include <copyfile.h>
+#include <removefile.h>
 
-#define SRC "/Users/suvasanketrout/dev/dir_sync/test/"
-#define DST "/Users/suvasanketrout/dev/dir_sync/test_copy/"
+char *src_path, *dst_path;
+int verbose_f = 0;
+
+#define green_str(str) "\x1b[32m" str "\x1b[0m"
+
+int remove_entry(const char *target) {
+    removefile_state_t state = removefile_state_alloc();
+
+    int ret = removefile(target, state, REMOVEFILE_RECURSIVE);
+
+    if (ret < 0) {
+        perror("Error: Remove action failed");
+        removefile_state_free(state);
+        return 1;
+    }
+
+    if (verbose_f) fprintf(stdout, "Removed: %s\n", target);
+    removefile_state_free(state);
+    return 0;
+}
 
 int copy_entry(const char *src, const char *dst) {
     copyfile_state_t state = copyfile_state_alloc();
@@ -14,10 +34,13 @@ int copy_entry(const char *src, const char *dst) {
     int ret = copyfile(src, dst, state, COPYFILE_ALL);
 
     if (ret < 0) {
-        perror("Error: Copy failed");
+        perror("Error: Copy action failed");
         copyfile_state_free(state);
         return 1;
     }
+
+    if (verbose_f) fprintf(stdout, "Copied to: %s\n", dst);
+    copyfile_state_free(state);
     return 0;
 }
 
@@ -30,24 +53,36 @@ void callback_fn(
         const FSEventStreamEventId eventIds[])
 {
     // act
-    char **entries = eventPaths;
-    for(size_t i = 0; i < numEvents; ++i){
+    char **entries = (char **)eventPaths;
+
+    for(size_t i = 0; i < numEvents; i++){
         char *src = entries[i];
-        char *src_entry = src + strlen(SRC);
-        char dst[sizeof(DST) + strlen(src_entry)];
-        snprintf(dst, sizeof dst, DST"%s", src_entry);
+        char *src_entry = src + strlen(src_path);
+        char dst[strlen(dst_path) + strlen(src_entry) + 1];
+        snprintf(dst, sizeof dst, "%s%s", dst_path, src_entry);
 
-        if (copy_entry(src, dst)) continue;
+        int marked_i;
+        if ((eventFlags[i] & kFSEventStreamEventFlagItemRemoved) ||
+                (eventFlags[i] & kFSEventStreamEventFlagItemRenamed) && marked_i+1 != i) {
+            marked_i = i;
+            if (access(dst, F_OK) == 0) {
+                if (remove_entry(dst)) continue;
+            }
+        } else {
+            if (copy_entry(src, dst)) continue;
+        }
     }
-
 
     fflush(stdout);
 }
 
-int fs_watch() {
-    CFStringRef myPath = CFSTR(SRC);
+int fs_watch(const char *src) {
+    CFStringRef myPath = CFStringCreateWithCString(kCFAllocatorDefault,
+            src,
+            kCFStringEncodingUTF8);
 
     CFArrayRef pathsToWatch = CFArrayCreate(NULL, (const void **)&myPath, 1, NULL);
+
     FSEventStreamContext context = {0, NULL, NULL, NULL, NULL};
 
     FSEventStreamRef stream;
@@ -61,7 +96,7 @@ int fs_watch() {
             kFSEventStreamCreateFlagFileEvents
             );
 
-    dispatch_queue_t myQueue = dispatch_queue_create("DirSync", NULL);
+    dispatch_queue_t myQueue = dispatch_queue_create("com.rocky.dirsync", NULL);
 
     FSEventStreamSetDispatchQueue(stream, myQueue);
 
@@ -70,17 +105,41 @@ int fs_watch() {
         return 1;
     }
 
-    printf("Started watching: "SRC"\n");
-    dispatch_main();
+    if (verbose_f) printf("♦ Setup complete for: %s\n", src);
+
+    CFRelease(pathsToWatch);
+    CFRelease(myPath);
+
+    return 0;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    int opt;
+    while ((opt = getopt(argc, argv, "vs:d:")) != -1) {
+        switch (opt) {
+            case 'v':
+                verbose_f = 1; break;
+            case 's':
+                if (optarg) src_path = strdup(optarg);
+                break;
+            case 'd':
+                if (optarg) dst_path = strdup(optarg);
+                break;
+            default:
+                return EXIT_FAILURE;
+        }
+    }
+
+
     /* Path Check */
     struct stat sb;
-    if (stat(SRC, &sb) == -1) { perror(SRC); return -1; }
-    if (stat(DST, &sb) == -1) { perror(DST); return -1; }
+    if (stat(src_path, &sb) == -1) { fprintf(stderr, "%s", src_path); return -1; }
+    if (stat(dst_path, &sb) == -1) { fprintf(stderr, "%s", dst_path); return -1; }
 
-    if (fs_watch()) return -1;
+    if (verbose_f) printf(green_str("✔ FilePath Exist\n"));
 
+    if (fs_watch(src_path)) return -1;
+
+    dispatch_main();
     return 0;
 }
