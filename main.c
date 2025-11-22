@@ -1,10 +1,25 @@
 #include <stdio.h>
+#include <string.h>
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
 #include <sys/stat.h>
+#include <copyfile.h>
 
 #define SRC "/Users/suvasanketrout/dev/dir_sync/test/"
 #define DST "/Users/suvasanketrout/dev/dir_sync/test_copy/"
+
+int copy_entry(const char *src, const char *dst) {
+    copyfile_state_t state = copyfile_state_alloc();
+
+    int ret = copyfile(src, dst, state, COPYFILE_ALL);
+
+    if (ret < 0) {
+        perror("Error: Copy failed");
+        copyfile_state_free(state);
+        return 1;
+    }
+    return 0;
+}
 
 void callback_fn(
         ConstFSEventStreamRef streamRef,
@@ -17,21 +32,14 @@ void callback_fn(
     // act
     char **entries = eventPaths;
     for(size_t i = 0; i < numEvents; ++i){
-        printf(entries[i]);
+        char *src = entries[i];
+        char *src_entry = src + strlen(SRC);
+        char dst[sizeof(DST) + strlen(src_entry)];
+        snprintf(dst, sizeof dst, DST"%s", src_entry);
+
+        if (copy_entry(src, dst)) continue;
     }
 
-    // copyfile_state_t state = copyfile_state_alloc();
-    //
-    // const char *src;
-    // const char *dst;
-    //
-    // int ret = copyfile(SRC, DST, state, COPYFILE_ALL);
-    //
-    // if (ret < 0) {
-    //     perror("Critical Error: Copy failed");
-    //     copyfile_state_free(state);
-    //     return -1;
-    // }
 
     fflush(stdout);
 }
@@ -68,11 +76,11 @@ int fs_watch() {
 
 int main() {
     /* Path Check */
-    // struct stat *sb = NULL;
-    // if (stat(SRC, sb)) { perror(SRC); return -1; }
-    // if (stat(DST, sb)) { perror(DST); return -1; }
+    struct stat sb;
+    if (stat(SRC, &sb) == -1) { perror(SRC); return -1; }
+    if (stat(DST, &sb) == -1) { perror(DST); return -1; }
 
-    if (fs_watch()) return 1;
+    if (fs_watch()) return -1;
 
     return 0;
 }
