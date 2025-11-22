@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <CoreServices/CoreServices.h>
@@ -12,6 +13,7 @@ int verbose_f = 0;
 
 #define green_str(str) "\x1b[32m" str "\x1b[0m"
 
+/* entry remove function */
 int remove_entry(const char *target) {
     removefile_state_t state = removefile_state_alloc();
 
@@ -28,6 +30,7 @@ int remove_entry(const char *target) {
     return 0;
 }
 
+/* entry copy function */
 int copy_entry(const char *src, const char *dst) {
     copyfile_state_t state = copyfile_state_alloc();
 
@@ -44,6 +47,7 @@ int copy_entry(const char *src, const char *dst) {
     return 0;
 }
 
+/* callback function */
 void callback_fn(
         ConstFSEventStreamRef streamRef,
         void *clientCallBackInfo,
@@ -76,8 +80,10 @@ void callback_fn(
     fflush(stdout);
 }
 
+/* watch function */
 int fs_watch(const char *src) {
-    CFStringRef myPath = CFStringCreateWithCString(kCFAllocatorDefault,
+    CFStringRef myPath = CFStringCreateWithCString(
+            kCFAllocatorDefault,
             src,
             kCFStringEncodingUTF8);
 
@@ -93,8 +99,7 @@ int fs_watch(const char *src) {
             pathsToWatch,
             kFSEventStreamEventIdSinceNow,
             1.0,
-            kFSEventStreamCreateFlagFileEvents
-            );
+            kFSEventStreamCreateFlagFileEvents);
 
     dispatch_queue_t myQueue = dispatch_queue_create("com.rocky.dirsync", NULL);
 
@@ -113,6 +118,23 @@ int fs_watch(const char *src) {
     return 0;
 }
 
+/* Helper: safe copy */
+int copy_path(char **to, const char *from) {
+    if (!to || !from) return 1;
+    size_t len = strlen(from);
+    int need_slash = (len == 0) ? 0 : (from[len - 1] != '/');
+    int n = snprintf(NULL, 0, "%s%s", from, need_slash ? "/" : "");
+    if (n < 0) return 1;
+    char *tmp = malloc((size_t)n + 1);
+    if (!tmp) return 1;
+    if (snprintf(tmp, (size_t)n + 1, "%s%s", from, need_slash ? "/" : "") < 0) {
+        free(tmp);
+        return 1;
+    }
+    *to = tmp;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int opt;
     while ((opt = getopt(argc, argv, "vs:d:")) != -1) {
@@ -120,10 +142,10 @@ int main(int argc, char **argv) {
             case 'v':
                 verbose_f = 1; break;
             case 's':
-                if (optarg) src_path = strdup(optarg);
+                if (optarg) copy_path(&src_path, optarg);
                 break;
             case 'd':
-                if (optarg) dst_path = strdup(optarg);
+                if (optarg) copy_path(&dst_path, optarg);
                 break;
             default:
                 return EXIT_FAILURE;
@@ -138,8 +160,9 @@ int main(int argc, char **argv) {
 
     if (verbose_f) printf(green_str("✔ FilePath Exist\n"));
 
+    /* path watch */
     if (fs_watch(src_path)) return -1;
+    dispatch_main(); //block
 
-    dispatch_main();
     return 0;
 }
