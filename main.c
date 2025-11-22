@@ -9,28 +9,33 @@
 #include <removefile.h>
 #include <errno.h>
 
-// mkpath_np is a non-portable (macOS) function equivalent to 'mkdir -p'
+// Forward declarations
 int mkpath_np(const char *path, mode_t mode);
 int asprintf(char **strp, const char *fmt, ...);
 
 char *src_path = NULL;
 char *dst_path = NULL;
+
+// Flags
 int verbose_f = 0;
 int keep_f = 0;
+int move_f = 0; // New: Move mode (Copy Src->Dst, then Delete Src)
 
-// Global flag indicating if destination is currently writable/mounted
+// State
 volatile int is_dest_ready = 0;
 
 #define green_str(str)  "\x1b[32m" str "\x1b[0m"
 #define red_str(str)    "\x1b[31m" str "\x1b[0m"
 #define yellow_str(str) "\x1b[33m" str "\x1b[0m"
 #define blue_str(str)   "\x1b[34m" str "\x1b[0m"
+#define mag_str(str)    "\x1b[35m" str "\x1b[0m"
 
 /* -------------------------------------------------------------------------- */
 /*                                File Operations                             */
 /* -------------------------------------------------------------------------- */
 
 int remove_entry(const char *target) {
+    // Check existence first to avoid errors
     if (access(target, F_OK) != 0) return 0;
 
     removefile_state_t state = removefile_state_alloc();
@@ -49,13 +54,13 @@ int remove_entry(const char *target) {
 
 int copy_entry(const char *src, const char *dst) {
     copyfile_state_t state = copyfile_state_alloc();
+    // COPYFILE_ALL: metadata/permissions. COPYFILE_NOFOLLOW: handle symlinks correctly.
     int ret = copyfile(src, dst, state, COPYFILE_ALL | COPYFILE_NOFOLLOW);
 
     if (ret < 0) {
-        // Ignore if src disappeared during processing
         if (access(src, F_OK) != 0) {
             copyfile_state_free(state);
-            return 0;
+            return 0; // Source disappeared, ignore
         }
         if (verbose_f) perror("Copy failed");
         copyfile_state_free(state);
@@ -71,11 +76,6 @@ int copy_entry(const char *src, const char *dst) {
 /*                            Connection Monitor                              */
 /* -------------------------------------------------------------------------- */
 
-/*
-   Checks if destination exists.
-   If not, tries to create it (mkdir -p).
-   If that fails (e.g. volume not mounted), sets ready=0.
-   */
 void check_destination_availability() {
     struct stat sb;
     int exists = (stat(dst_path, &sb) == 0 && S_ISDIR(sb.st_mode));
@@ -93,9 +93,9 @@ void check_destination_availability() {
                 is_dest_ready = 1;
             }
         } else {
-            // Creation failed (Volume missing, permission error, etc)
+            // Creation failed (Volume missing)
             if (is_dest_ready) {
-                if (verbose_f) fprintf(stderr, "%s Destination lost (Waiting for mount...): %s\n", yellow_str("⚠"), dst_path);
+                if (verbose_f) fprintf(stderr, "%s Destination lost (Waiting...): %s\n", yellow_str("*"), dst_path);
                 is_dest_ready = 0;
             }
         }
@@ -114,8 +114,6 @@ void callback_fn(
         const FSEventStreamEventFlags eventFlags[],
         const FSEventStreamEventId eventIds[])
 {
-    // If destination is missing (unmounted), we drop events.
-    // (Queuing events during downtime is complex; dropping is safer for this scope)
     if (!is_dest_ready) return;
 
     char **entries = (char **)eventPaths;
@@ -123,7 +121,6 @@ void callback_fn(
     for(size_t i = 0; i < numEvents; i++){
         char *src_full = entries[i];
 
-        // Basic sanity checks
         if (strlen(src_full) < strlen(src_path)) continue;
         char *rel_path = src_full + strlen(src_path);
         if (strstr(rel_path, ".DS_Store")) continue;
@@ -133,11 +130,20 @@ void callback_fn(
 
         struct stat sb;
         if (lstat(src_full, &sb) == 0) {
-            // Source Exists -> Copy
-            copy_entry(src_full, dst_full);
+            // --- FILE EXISTS AT SOURCE ---
+            // Action: Copy to Dest
+            if (copy_entry(src_full, dst_full) == 0) {
+                // Logic: Move Mode
+                // If copy succeeded AND Move Mode is on -> Delete Source
+                if (move_f) {
+                    remove_entry(src_full);
+                }
+            }
         } else {
-            // Source Removed
-            if (keep_f) {
+            // --- FILE GONE FROM SOURCE ---
+            // If we are in Move Mode OR Keep Mode, we do NOT delete from Dest.
+            // (In move mode, the file is gone because we just deleted it above).
+            if (keep_f || move_f) {
                 if (verbose_f) fprintf(stdout, "%s %s\n", yellow_str("[SKIP DEL]"), dst_full);
             } else {
                 remove_entry(dst_full);
@@ -160,7 +166,7 @@ int fs_watch(const char *src) {
     FSEventStreamRef stream = FSEventStreamCreate(
             NULL, &callback_fn, &context, pathsToWatch,
             kFSEventStreamEventIdSinceNow,
-            0.3, // 0.3s latency
+            0.3,
             kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
             );
 
@@ -168,26 +174,19 @@ int fs_watch(const char *src) {
     FSEventStreamSetDispatchQueue(stream, myQueue);
 
     if (!FSEventStreamStart(stream)) {
-        if (verbose_f) fprintf(stderr, "FSWatch: Failed to start watch\n");
+        fprintf(stderr, "FSWatch: Failed to start watch\n");
         return 1;
     }
 
-    // --- Heartbeat Timer for Destination Monitoring ---
+    // Heartbeat Timer
     dispatch_queue_t monitorQueue = dispatch_queue_create("com.rocky.dirsync.monitor", NULL);
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, monitorQueue);
-
-    // Fire every 2 seconds
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-
-    dispatch_source_set_event_handler(timer, ^{
-            check_destination_availability();
-            });
+    dispatch_source_set_event_handler(timer, ^{ check_destination_availability(); });
     dispatch_resume(timer);
-    // --------------------------------------------------
 
     if (verbose_f) printf("♦ Service Started.\n");
 
-    // Initial Check
     check_destination_availability();
 
     CFRelease(pathsToWatch);
@@ -198,7 +197,7 @@ int fs_watch(const char *src) {
 void set_path(char **to, const char *from) {
     size_t len = strlen(from);
     size_t copy_len = len;
-    if (len > 1 && from[len - 1] == '/') copy_len--; // Trim trailing slash
+    if (len > 1 && from[len - 1] == '/') copy_len--;
     *to = malloc(copy_len + 1);
     if (!*to) exit(1);
     strncpy(*to, from, copy_len);
@@ -207,15 +206,20 @@ void set_path(char **to, const char *from) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        if (verbose_f) fprintf(stderr, "Usage: %s -s <src> -d <dst> [-v] [-k]\n", argv[0]);
+        fprintf(stderr, "Usage: %s -s <src> -d <dst> [-v] [-k] [-m]\n", argv[0]);
+        fprintf(stderr, " -v: Verbose mode (show logs)\n");
+        fprintf(stderr, " -k: Keep mode (don't delete dest if src deleted)\n");
+        fprintf(stderr, " -m: Move mode (copy to dest, then delete src)\n");
         return EXIT_FAILURE;
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "vs:d:k")) != -1) {
+    // Added 'm' to getopt
+    while ((opt = getopt(argc, argv, "vs:d:km")) != -1) {
         switch (opt) {
             case 'v': verbose_f = 1; break;
             case 'k': keep_f = 1; break;
+            case 'm': move_f = 1; break;
             case 's': set_path(&src_path, optarg); break;
             case 'd': set_path(&dst_path, optarg); break;
             default: return EXIT_FAILURE;
@@ -223,22 +227,23 @@ int main(int argc, char **argv) {
     }
 
     if (!src_path || !dst_path) {
-        if (verbose_f) fprintf(stderr, "Error: Source and Destination paths required.\n");
+        fprintf(stderr, "Error: Source and Destination paths required.\n");
         return EXIT_FAILURE;
     }
 
-    // Validate Source immediately (Source must exist to watch it)
     struct stat sb;
     if (stat(src_path, &sb) == -1) {
         perror("Error accessing Source");
         return EXIT_FAILURE;
     }
 
-    printf("Source: %s\nDest:   %s\n", src_path, dst_path);
-    if (keep_f) printf("Mode:   %s\n", yellow_str("KEEP (Safe Mode)"));
-
-    // Note: We do NOT validate destination here.
-    // The timer in fs_watch will handle creation/waiting.
+    // Initial Setup logging only if verbose
+    if (verbose_f) {
+        printf("Source: %s\nDest:   %s\n", src_path, dst_path);
+        if (move_f) printf("Mode:   %s\n", mag_str("MOVE"));
+        else if (keep_f) printf("Mode:   %s\n", yellow_str("KEEP"));
+        else printf("Mode:   Sync\n");
+    }
 
     if (fs_watch(src_path)) return EXIT_FAILURE;
 
