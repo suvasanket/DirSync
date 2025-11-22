@@ -19,7 +19,7 @@ char *dst_path = NULL;
 // Flags
 int verbose_f = 0;
 int keep_f = 0;
-int move_f = 0; // New: Move mode (Copy Src->Dst, then Delete Src)
+int move_f = 0;
 
 // State
 volatile int is_dest_ready = 0;
@@ -35,7 +35,14 @@ volatile int is_dest_ready = 0;
 /* -------------------------------------------------------------------------- */
 
 int remove_entry(const char *target) {
-    // Check existence first to avoid errors
+    // --- SAFETY CRITICAL CHECK ---
+    // Never delete the root Source or Root Destination
+    if (strcmp(target, src_path) == 0 || strcmp(target, dst_path) == 0) {
+        if (verbose_f) fprintf(stderr, "SAFETY: Prevented deletion of root path: %s\n", target);
+        return 1;
+    }
+    // -----------------------------
+
     if (access(target, F_OK) != 0) return 0;
 
     removefile_state_t state = removefile_state_alloc();
@@ -54,13 +61,12 @@ int remove_entry(const char *target) {
 
 int copy_entry(const char *src, const char *dst) {
     copyfile_state_t state = copyfile_state_alloc();
-    // COPYFILE_ALL: metadata/permissions. COPYFILE_NOFOLLOW: handle symlinks correctly.
     int ret = copyfile(src, dst, state, COPYFILE_ALL | COPYFILE_NOFOLLOW);
 
     if (ret < 0) {
         if (access(src, F_OK) != 0) {
             copyfile_state_free(state);
-            return 0; // Source disappeared, ignore
+            return 0;
         }
         if (verbose_f) perror("Copy failed");
         copyfile_state_free(state);
@@ -86,14 +92,12 @@ void check_destination_availability() {
             is_dest_ready = 1;
         }
     } else {
-        // Try to create it
         if (mkpath_np(dst_path, 0755) == 0) {
             if (!is_dest_ready) {
                 if (verbose_f) fprintf(stdout, "%s Destination created: %s\n", blue_str("♦"), dst_path);
                 is_dest_ready = 1;
             }
         } else {
-            // Creation failed (Volume missing)
             if (is_dest_ready) {
                 if (verbose_f) fprintf(stderr, "%s Destination lost (Waiting...): %s\n", yellow_str("*"), dst_path);
                 is_dest_ready = 0;
@@ -121,7 +125,12 @@ void callback_fn(
     for(size_t i = 0; i < numEvents; i++){
         char *src_full = entries[i];
 
-        if (strlen(src_full) < strlen(src_path)) continue;
+        // --- FIX 1: Skip if the event is for the Root Source Folder itself ---
+        if (strcmp(src_full, src_path) == 0) continue;
+
+        // Double check length to be safe
+        if (strlen(src_full) <= strlen(src_path)) continue;
+
         char *rel_path = src_full + strlen(src_path);
         if (strstr(rel_path, ".DS_Store")) continue;
 
@@ -130,19 +139,14 @@ void callback_fn(
 
         struct stat sb;
         if (lstat(src_full, &sb) == 0) {
-            // --- FILE EXISTS AT SOURCE ---
-            // Action: Copy to Dest
+            // Source Exists -> Copy
             if (copy_entry(src_full, dst_full) == 0) {
-                // Logic: Move Mode
-                // If copy succeeded AND Move Mode is on -> Delete Source
                 if (move_f) {
                     remove_entry(src_full);
                 }
             }
         } else {
-            // --- FILE GONE FROM SOURCE ---
-            // If we are in Move Mode OR Keep Mode, we do NOT delete from Dest.
-            // (In move mode, the file is gone because we just deleted it above).
+            // Source Gone
             if (keep_f || move_f) {
                 if (verbose_f) fprintf(stdout, "%s %s\n", yellow_str("[SKIP DEL]"), dst_full);
             } else {
@@ -178,7 +182,6 @@ int fs_watch(const char *src) {
         return 1;
     }
 
-    // Heartbeat Timer
     dispatch_queue_t monitorQueue = dispatch_queue_create("com.rocky.dirsync.monitor", NULL);
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, monitorQueue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
@@ -207,14 +210,10 @@ void set_path(char **to, const char *from) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s -s <src> -d <dst> [-v] [-k] [-m]\n", argv[0]);
-        fprintf(stderr, " -v: Verbose mode (show logs)\n");
-        fprintf(stderr, " -k: Keep mode (don't delete dest if src deleted)\n");
-        fprintf(stderr, " -m: Move mode (copy to dest, then delete src)\n");
         return EXIT_FAILURE;
     }
 
     int opt;
-    // Added 'm' to getopt
     while ((opt = getopt(argc, argv, "vs:d:km")) != -1) {
         switch (opt) {
             case 'v': verbose_f = 1; break;
@@ -231,18 +230,23 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    // Basic equality check to prevent user error
+    if (strcmp(src_path, dst_path) == 0) {
+        fprintf(stderr, "Error: Source and Destination cannot be the same path.\n");
+        return EXIT_FAILURE;
+    }
+
     struct stat sb;
     if (stat(src_path, &sb) == -1) {
         perror("Error accessing Source");
         return EXIT_FAILURE;
     }
 
-    // Initial Setup logging only if verbose
     if (verbose_f) {
         printf("Source: %s\nDest:   %s\n", src_path, dst_path);
-        if (move_f) printf("Mode:   %s\n", mag_str("MOVE"));
-        else if (keep_f) printf("Mode:   %s\n", yellow_str("KEEP"));
-        else printf("Mode:   Sync\n");
+        if (move_f) printf("Mode:   %s\n", mag_str("MOVE (Source -> Dest -> Delete Source)"));
+        else if (keep_f) printf("Mode:   %s\n", yellow_str("KEEP (Safe Mode)"));
+        else printf("Mode:   Sync (Mirror)\n");
     }
 
     if (fs_watch(src_path)) return EXIT_FAILURE;
